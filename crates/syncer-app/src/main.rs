@@ -10,6 +10,7 @@ mod autostart;
 mod eframe_app;
 mod format;
 mod notifications;
+mod pipeline;
 #[cfg(feature = "tray")]
 mod tray;
 mod ui;

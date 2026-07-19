@@ -1,31 +1,79 @@
-//! Recent uploads tab.
-//!
-//! `StateDb::get_pending()` is the only query safely available from
-//! syncer-app right now; there is no "recently uploaded, ordered by
-//! uploaded_at DESC" query exposed yet. Rather than reaching around the
-//! crate boundary with an ad-hoc raw SELECT here (which would violate
-//! AGENTS.md's "keep UI-free logic inside syncer-core" rule), this tab is a
-//! placeholder empty state. Follow-up for M5: add a
-//! `StateDb::get_recent_uploads(limit)` query in syncer-core and wire it in
-//! here, with each row clickable to open
-//! `{server_url}/photos/{asset_id}` via `open::that`.
+//! Recent uploads tab: the latest uploaded/duplicate files from the state
+//! DB, newest first. Clicking a row opens the asset in the browser.
 
 use crate::app::App;
+
+const RECENT_LIMIT: u32 = 50;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     ui.heading("Recent uploads");
     ui.add_space(8.0);
 
-    ui.label("No uploads yet.");
-    ui.add_space(4.0);
-    ui.weak(
-        "This list will populate once the scanner/uploader pipeline (M3) and a \
-         recent-uploads query (M5) are wired in. Click a row will open the asset \
-         in the browser once populated.",
-    );
+    let Some(db) = &app.state_db else {
+        ui.label("State database unavailable.");
+        return;
+    };
 
-    // Keep `app` used (avoids an unused-parameter lint if the tab ever
-    // becomes purely static); also a natural spot to trigger a manual
-    // refresh once the real query exists.
-    let _ = &app.pending_count;
+    let records = match db.get_recent_uploads(RECENT_LIMIT) {
+        Ok(records) => records,
+        Err(err) => {
+            ui.colored_label(
+                egui::Color32::from_rgb(0xd8, 0x3a, 0x3a),
+                format!("Failed to load recent uploads: {err}"),
+            );
+            return;
+        }
+    };
+
+    if records.is_empty() {
+        ui.label("No uploads yet.");
+        return;
+    }
+
+    let server_url = app
+        .config
+        .server_url
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::Grid::new("recent_uploads_grid")
+            .num_columns(3)
+            .spacing([16.0, 4.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for record in &records {
+                    let file_name = record
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| record.path.display().to_string());
+                    ui.label(file_name);
+
+                    let uploaded_at = record
+                        .uploaded_at
+                        .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                        .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    ui.label(uploaded_at);
+
+                    if let Some(asset_id) = &record.asset_id {
+                        if !server_url.is_empty() {
+                            if ui.link("Open").clicked() {
+                                let url = format!("{server_url}/photos/{asset_id}");
+                                if let Err(err) = open::that(&url) {
+                                    tracing::warn!("failed to open {url}: {err}");
+                                }
+                            }
+                        } else {
+                            ui.weak("(set server URL)");
+                        }
+                    } else {
+                        ui.weak("-");
+                    }
+                    ui.end_row();
+                }
+            });
+    });
 }

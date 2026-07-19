@@ -47,6 +47,15 @@ impl TrayHandle {
     /// fails (e.g. no system tray host available), in which case the caller
     /// should continue running window-only.
     pub fn new() -> anyhow::Result<Self> {
+        // On Linux, `tray-icon`'s menu/appindicator backend is built on GTK
+        // and requires `gtk::init()` to have run first — unlike the eframe
+        // window itself, which uses winit/GLX directly and never touches
+        // GTK. Without this, building the tray menu panics inside the gtk
+        // crate ("GTK has not been initialized"). Windows/macOS don't use
+        // GTK and skip this.
+        #[cfg(target_os = "linux")]
+        gtk::init().map_err(|e| anyhow::anyhow!("failed to initialize GTK for tray icon: {e}"))?;
+
         let open_item = MenuItem::new("Open", true, None);
         let pause_item = MenuItem::new("Pause sync", true, None);
         let quit_item = MenuItem::new("Quit", true, None);
@@ -89,6 +98,15 @@ impl TrayHandle {
     /// Non-blocking poll of pending tray/menu events, translated into at
     /// most one [`TrayAction`] per call. Call this once per UI frame.
     pub fn poll(&mut self) -> Option<TrayAction> {
+        // The GTK/appindicator backend needs its own main loop pumped for
+        // menu interaction to work at all (winit's event loop knows nothing
+        // about GTK). Draining pending iterations here, once per UI frame,
+        // avoids running a second full event loop on its own thread.
+        #[cfg(target_os = "linux")]
+        while gtk::events_pending() {
+            gtk::main_iteration_do(false);
+        }
+
         if let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id() == &self.open_id {
                 return Some(TrayAction::Open);

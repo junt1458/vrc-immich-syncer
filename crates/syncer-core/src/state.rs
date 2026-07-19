@@ -290,6 +290,33 @@ impl StateDb {
         Ok(rows)
     }
 
+    /// Returns the most recently uploaded/duplicate rows (both count as
+    /// "handled"), newest first, up to `limit`.
+    pub fn get_recent_uploads(&self, limit: u32) -> anyhow::Result<Vec<FileRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM files WHERE status IN (?1, ?2) \
+             ORDER BY COALESCE(uploaded_at, 0) DESC, id DESC LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![FileStatus::Uploaded, FileStatus::Duplicate, limit],
+                row_to_record,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Returns the number of rows currently in `failed` status (including
+    /// those not yet due for retry).
+    pub fn count_failed(&self) -> anyhow::Result<i64> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE status = ?1",
+            params![FileStatus::Failed],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Looks up a file record by its path.
     pub fn find_by_path(&self, path: &Path) -> anyhow::Result<Option<FileRecord>> {
         let path_str = path_to_string(path)?;
@@ -469,6 +496,42 @@ mod tests {
         let pending = db.get_pending().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].path, p1);
+    }
+
+    #[test]
+    fn get_recent_uploads_orders_newest_first_and_respects_limit() {
+        let db = StateDb::open_in_memory().unwrap();
+        let p1 = PathBuf::from("/screenshots/r1.png");
+        let p2 = PathBuf::from("/screenshots/r2.png");
+        let p3 = PathBuf::from("/screenshots/r3.png");
+        let pending = PathBuf::from("/screenshots/r4.png");
+
+        db.upsert_pending(&p1, 1, 1).unwrap();
+        db.mark_uploaded(&p1, "sha1", "asset-1", ts(1000)).unwrap();
+        db.upsert_pending(&p2, 1, 1).unwrap();
+        db.mark_duplicate(&p2, "sha2", "asset-2").unwrap();
+        db.upsert_pending(&p3, 1, 1).unwrap();
+        db.mark_uploaded(&p3, "sha3", "asset-3", ts(3000)).unwrap();
+        db.upsert_pending(&pending, 1, 1).unwrap();
+
+        let recent = db.get_recent_uploads(2).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].path, p3);
+        assert!(recent.iter().all(|r| r.path != pending));
+    }
+
+    #[test]
+    fn count_failed_counts_only_failed_rows() {
+        let db = StateDb::open_in_memory().unwrap();
+        let ok_path = PathBuf::from("/screenshots/ok.png");
+        let failed_path = PathBuf::from("/screenshots/failed.png");
+
+        db.upsert_pending(&ok_path, 1, 1).unwrap();
+        db.mark_uploaded(&ok_path, "sha", "asset", ts(1)).unwrap();
+        db.upsert_pending(&failed_path, 1, 1).unwrap();
+        db.mark_failed(&failed_path, "err", ts(100)).unwrap();
+
+        assert_eq!(db.count_failed().unwrap(), 1);
     }
 
     #[test]

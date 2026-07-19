@@ -4409,6 +4409,7 @@ dependencies = [
  "chrono",
  "eframe",
  "egui",
+ "gtk",
  "immich-client",
  "notify-rust",
  "open",

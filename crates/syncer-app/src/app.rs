@@ -1,14 +1,12 @@
 //! App state and runtime wiring: holds `Config`, a `StateDb` handle, a
-//! background tokio runtime for async Immich calls, and the channel used to
-//! bring results back onto the egui thread.
+//! background tokio runtime for async Immich calls, the background scan/
+//! watch/upload pipeline (`pipeline.rs`), and the channel used to bring
+//! results back onto the egui thread.
 //!
-//! Event handling is deliberately isolated behind [`App::handle_event`] and
-//! the local [`AppEvent`] enum rather than being spread across UI widget
-//! code, so that wiring a live `syncer_core::SyncEvent` receiver in M5 is a
-//! localized change. `AppEvent::Sync` already wraps the real
-//! `syncer_core::SyncEvent` shape (it exists as of this milestone), but no
-//! producer is wired up yet in M4 — the app instead polls `StateDb`
-//! directly on a timer for queue counts.
+//! Event handling is isolated behind [`App::handle_event`] and the local
+//! [`AppEvent`] enum rather than being spread across UI widget code.
+//! `AppEvent::Sync` wraps the real `syncer_core::SyncEvent`, forwarded here
+//! from the pipeline task via `event_tx`.
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -24,6 +22,7 @@ use immich_client::{ImmichClient, ServerAboutResponse, UserResponse};
 use syncer_core::{Config, StateDb};
 
 use crate::notifications::RateLimiter;
+use crate::pipeline::PipelineHandle;
 #[cfg(feature = "tray")]
 use crate::tray::{TrayAction, TrayHandle, TrayState};
 
@@ -57,12 +56,7 @@ pub enum AppEvent {
     /// The Settings tab's "Test connection" probe completed, with a
     /// human-readable result message.
     TestConnectionCompleted(String),
-    /// A core sync event, forwarded as-is. `handle_event` already knows how
-    /// to react to it (see below); the only missing piece is a producer,
-    /// which arrives in M5 once a live `syncer_core::SyncEvent` receiver is
-    /// wired into the app's event loop (no scanner/uploader exists to emit
-    /// these into `event_tx` yet in M4).
-    #[allow(dead_code, reason = "constructed by M5's event-bus wiring, not M4")]
+    /// A core sync event forwarded from the background pipeline task.
     Sync(syncer_core::SyncEvent),
 }
 
@@ -89,6 +83,7 @@ pub struct App {
     pub status_pending: bool,
     pub last_scan_time: Option<DateTime<Utc>>,
     pub pending_count: usize,
+    pub failed_count: i64,
 
     /// Editable copies of config fields for the Settings tab (kept separate
     /// from `config` until "Save" is pressed).
@@ -100,9 +95,11 @@ pub struct App {
 
     pub notification_rate_limiter: RateLimiter,
 
-    /// Shared flag toggled by the tray "Pause sync" menu item.
-    /// TODO(M5): actually pause the scanner/uploader when this is set.
-    #[cfg(feature = "tray")]
+    /// Shared with the background pipeline task; while set, scanning/
+    /// uploading pauses (the filesystem watcher keeps enqueueing new files
+    /// regardless, so nothing is missed, it's just not uploaded yet).
+    /// Toggled by the tray's "Pause sync" menu item when the `tray` feature
+    /// is enabled.
     pub paused: Arc<AtomicBool>,
     /// Set by the tray "Quit" menu item to request a real process exit.
     pub quit_requested: Arc<AtomicBool>,
@@ -112,6 +109,10 @@ pub struct App {
 
     #[cfg(feature = "tray")]
     pub tray: Option<TrayHandle>,
+
+    /// Handle to the background scan/watch/upload task; `None` if the state
+    /// database couldn't be opened (surfaced via `state_db_error` instead).
+    pipeline: Option<PipelineHandle>,
 
     runtime: tokio::runtime::Runtime,
     command_tx: mpsc::UnboundedSender<Command>,
@@ -241,6 +242,24 @@ impl App {
             settings_draft.auto_start = actual;
         }
 
+        let paused = Arc::new(AtomicBool::new(false));
+
+        // The pipeline runs on its own dedicated thread/runtime (see
+        // pipeline.rs docs) and opens its own StateDb connections onto the
+        // same path `state_db` above was opened from. Its `SyncEvent`s
+        // arrive on a separate channel and are forwarded into `event_tx` as
+        // `AppEvent::Sync` by a small relay task on the shared runtime.
+        let pipeline = syncer_core::default_state_db_path().map(|db_path| {
+            let (sync_tx, mut sync_rx) = mpsc::unbounded_channel::<syncer_core::SyncEvent>();
+            let relay_event_tx = event_tx.clone();
+            runtime.spawn(async move {
+                while let Some(sync_event) = sync_rx.recv().await {
+                    let _ = relay_event_tx.send(AppEvent::Sync(sync_event));
+                }
+            });
+            crate::pipeline::spawn(config.clone(), db_path, sync_tx, paused.clone())
+        });
+
         Self {
             settings_draft,
             config,
@@ -252,17 +271,18 @@ impl App {
             status_pending: false,
             last_scan_time: None,
             pending_count: 0,
+            failed_count: 0,
             test_connection_result: None,
             test_connection_pending: false,
             auto_start_error: None,
             save_result: None,
             notification_rate_limiter: RateLimiter::new(Duration::from_secs(300)),
-            #[cfg(feature = "tray")]
-            paused: Arc::new(AtomicBool::new(false)),
+            paused,
             quit_requested: Arc::new(AtomicBool::new(false)),
             window_visible: !start_minimized,
             #[cfg(feature = "tray")]
             tray,
+            pipeline,
             runtime,
             command_tx,
             event_tx,
@@ -286,16 +306,14 @@ impl App {
                 self.test_connection_result = Some(message);
             }
             AppEvent::Sync(sync_event) => {
-                // TODO(M5): react to real scan/upload events (tray state,
-                // recent-uploads list) once the uploader's event stream is
-                // actually wired in (nothing produces `AppEvent::Sync` yet
-                // in M4). Failure/recovery notifications are already
-                // implemented below so M5 only needs to start forwarding
-                // real `SyncEvent`s here.
                 tracing::debug!("received sync event: {sync_event:?}");
                 let is_failure = matches!(sync_event, syncer_core::SyncEvent::UploadFailed { .. });
                 let is_success =
                     matches!(sync_event, syncer_core::SyncEvent::UploadSucceeded { .. });
+
+                if let syncer_core::SyncEvent::ScanFinished { .. } = &sync_event {
+                    self.last_scan_time = Some(Utc::now());
+                }
 
                 if is_failure && self.notification_rate_limiter.should_send(Instant::now()) {
                     crate::notifications::notify_upload_failure(1);
@@ -306,6 +324,16 @@ impl App {
                 // toast had actually been shown before.
                 if is_success && self.notification_rate_limiter.reset() {
                     crate::notifications::notify_recovered();
+                }
+
+                // A finished scan or upload is a good time to refresh the
+                // queue counts shown on the Status tab without waiting for
+                // the next 5s poll.
+                if is_success
+                    || is_failure
+                    || matches!(sync_event, syncer_core::SyncEvent::ScanFinished { .. })
+                {
+                    self.refresh_queue_counts();
                 }
             }
         }
@@ -335,17 +363,19 @@ impl App {
         });
     }
 
-    /// Re-reads pending-upload count from the state DB. Cheap enough to
-    /// call on a timer; failures are logged and leave the previous count.
+    /// Re-reads pending/failed upload counts from the state DB. Cheap enough
+    /// to call on a timer; failures are logged and leave the previous count.
     pub fn refresh_queue_counts(&mut self) {
         if let Some(db) = &self.state_db {
             match db.get_pending() {
                 Ok(rows) => self.pending_count = rows.len(),
                 Err(err) => tracing::warn!("failed to query pending uploads: {err}"),
             }
+            match db.count_failed() {
+                Ok(count) => self.failed_count = count,
+                Err(err) => tracing::warn!("failed to query failed uploads: {err}"),
+            }
         }
-        // TODO(M5): show failed count via StateDb::get_due_retries (and a
-        // "failed but not yet due" count) once the uploader is wired in.
     }
 
     /// Called once per frame from `update()` to do lightweight periodic
@@ -396,15 +426,17 @@ impl App {
         });
     }
 
-    /// Saves the current settings draft to `self.config` and persists it.
+    /// Saves the current settings draft to `self.config`, persists it, and
+    /// live-applies it to the running pipeline (restarts the watcher with
+    /// the new folder list, picks up new intervals/toggles).
     pub fn save_settings(&mut self) {
         self.settings_draft.apply_to(&mut self.config);
         match self.config.save() {
             Ok(()) => {
                 self.save_result = Some("Settings saved.".to_string());
-                // NOTE: live-apply (restarting watchers, rescheduling the
-                // scanner) is M5's job — it needs the running watcher/
-                // scanner handles that don't exist until M3/M5 wire them in.
+                if let Some(pipeline) = &self.pipeline {
+                    pipeline.update_config(self.config.clone());
+                }
             }
             Err(err) => {
                 self.save_result = Some(format!("Failed to save settings: {err}"));
@@ -428,12 +460,20 @@ impl App {
             TrayAction::TogglePause => {
                 let was_paused = self.paused.fetch_xor(true, Ordering::SeqCst);
                 tracing::info!("sync {}", if was_paused { "resumed" } else { "paused" });
-                // TODO(M5): actually pause the scanner/uploader.
             }
             TrayAction::Quit => {
+                if let Some(pipeline) = &self.pipeline {
+                    pipeline.shutdown();
+                }
                 self.quit_requested.store(true, Ordering::SeqCst);
             }
         }
+    }
+
+    /// Whether the pipeline is currently paused (only settable via the tray
+    /// menu, but readable regardless so the Status tab can reflect it).
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     #[cfg(feature = "tray")]
@@ -442,6 +482,14 @@ impl App {
             if let Err(err) = tray.set_state(state) {
                 tracing::warn!("failed to update tray icon state: {err}");
             }
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(pipeline) = &self.pipeline {
+            pipeline.shutdown();
         }
     }
 }

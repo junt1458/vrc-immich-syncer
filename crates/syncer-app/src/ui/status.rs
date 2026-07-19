@@ -85,17 +85,23 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui.end_row();
 
             ui.label("Failed uploads:");
-            // TODO(M5): show failed count via StateDb::get_due_retries once
-            // the uploader pipeline is wired in; not populated in M4.
-            ui.label("-");
+            ui.label(app.failed_count.to_string());
             ui.end_row();
 
             ui.label("Last scan:");
             ui.label(
                 app.last_scan_time
                     .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                    .unwrap_or_else(|| "never (scanner not wired in until M3/M5)".to_string()),
+                    .unwrap_or_else(|| "never yet".to_string()),
             );
+            ui.end_row();
+
+            ui.label("Sync:");
+            if app.is_paused() {
+                ui.colored_label(egui::Color32::from_rgb(0xd8, 0x8a, 0x3a), "Paused");
+            } else {
+                ui.label("Running");
+            }
             ui.end_row();
         });
 
