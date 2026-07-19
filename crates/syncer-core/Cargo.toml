@@ -1,0 +1,30 @@
+[package]
+name = "syncer-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Config, state ledger, scanner, watcher and upload pipeline for vrc-immich-syncer"
+
+[dependencies]
+immich-client = { path = "../immich-client" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+toml = "0.8"
+directories = "5"
+rusqlite = { version = "0.32", features = ["bundled"] }
+notify = "6"
+notify-debouncer-full = "0.3"
+walkdir = "2"
+sha1 = "0.10"
+png = "0.17"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
