@@ -1,12 +1,12 @@
 //! Tray icon integration (`tray-icon` crate), feature-gated behind `tray`.
 //!
-//! Builds simple generated idle/syncing/error icons (solid-color squares —
-//! real artwork is M6 polish), a menu with Open / Pause-Resume / Quit, and
-//! exposes a small polling API the main `App::update` loop calls each frame
-//! to react to tray icon / menu events. If tray init fails, `TrayHandle::new`
-//! returns `Err` and the caller falls back to window-only operation, per
-//! PLAN.md 3.3 ("app must still run with the window alone if tray init
-//! fails").
+//! Builds generated idle/syncing/error icons (a filled circle with a subtle
+//! ring and an upload-arrow glyph, see [`crate::icon`]), a menu with Open /
+//! Pause-Resume / Quit, and exposes a small polling API the main
+//! `App::update` loop calls each frame to react to tray icon / menu events.
+//! If tray init fails, `TrayHandle::new` returns `Err` and the caller falls
+//! back to window-only operation, per PLAN.md 3.3 ("app must still run with
+//! the window alone if tray init fails").
 
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -142,20 +142,18 @@ impl TrayHandle {
     }
 }
 
-/// Builds a simple solid-color 32x32 RGBA square icon for the given state.
-/// No external image assets needed; real artwork is deferred to M6 polish.
+/// Builds a generated 32x32 RGBA tray icon for the given state: a filled
+/// circle with a subtle ring and an upload-arrow glyph, color-coded by
+/// state (see [`crate::icon::generate_icon_rgba`]).
 fn build_icon(state: TrayState) -> anyhow::Result<tray_icon::Icon> {
     const SIZE: u32 = 32;
-    let (r, g, b) = match state {
+    let color = match state {
         TrayState::Idle => (0x3a, 0x7c, 0xd8),    // blue
         TrayState::Syncing => (0x2f, 0xa8, 0x4f), // green
         TrayState::Error => (0xd8, 0x3a, 0x3a),   // red
     };
 
-    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    for _ in 0..(SIZE * SIZE) {
-        rgba.extend_from_slice(&[r, g, b, 0xff]);
-    }
+    let rgba = crate::icon::generate_icon_rgba(color, SIZE);
 
     tray_icon::Icon::from_rgba(rgba, SIZE, SIZE)
         .map_err(|e| anyhow::anyhow!("failed to build tray icon: {e}"))
