@@ -4427,12 +4427,14 @@ name = "syncer-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "directories",
  "immich-client",
  "notify",
  "notify-debouncer-full",
  "png 0.17.16",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

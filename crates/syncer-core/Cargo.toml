@@ -24,7 +24,9 @@ notify-debouncer-full = "0.3"
 walkdir = "2"
 sha1 = "0.10"
 png = "0.17"
+async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+reqwest = { workspace = true }
